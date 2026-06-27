@@ -1,10 +1,9 @@
 #include "ili9342.h"
-#include "usb_image.h"
 #include "ch32v30x.h"
 #include "ch32v30x_gpio.h"
 #include "ch32v30x_rcc.h"
 
-/* Debug LED — 可在此修改引脚定义 */
+/* Debug LED — PA8 */
 #define DEBUG_LED_PORT    GPIOA
 #define DEBUG_LED_PIN     GPIO_Pin_8
 #define DEBUG_LED_ON()    GPIO_SetBits(DEBUG_LED_PORT, DEBUG_LED_PIN)
@@ -35,14 +34,7 @@ int main(void)
 {
     ili9342_init();
     ili9342_set_backlight(1);
-    usb_image_init();
     led_init();
-
-    ili9342_fill_rect(0, 0, 319, 239, 0x0000); /* black */
-    delay_ms(250);
-
-    usb_image_reset_stream();
-    usb_image_build_demo_frame();
 
     /* 启动快速闪烁，指示系统已初始化完成 */
     for (int i = 0; i < 6; i++) {
@@ -52,27 +44,24 @@ int main(void)
         delay_ms(80);
     }
 
-    uint32_t tick = 0;
+    const uint16_t colors[] = {
+        0xF800, /* 红 */
+        0x07E0, /* 绿 */
+        0x001F, /* 蓝 */
+        0xFFE0, /* 黄 */
+        0x07FF, /* 青 */
+        0xF81F, /* 紫 */
+        0xFFFF, /* 白 */
+        0x0000, /* 黑 */
+    };
+    const int num_colors = sizeof(colors) / sizeof(colors[0]);
+    int color_idx = 0;
 
     while (1) {
-        usb_image_poll();
-
-        if (usb_image_has_frame()) {
-            const uint8_t *frame = usb_image_get_frame_buffer();
-            ili9342_draw_rgb565_scaled(frame, 16, 12, 320, 240);
-            usb_image_reset_stream();
-            /* 收到帧时：LED 常亮 50ms 再熄灭，作为视觉反馈 */
-            DEBUG_LED_ON();
-            delay_ms(50);
-            DEBUG_LED_OFF();
-        }
-
-        /* 心跳闪烁：每 20 次循环（约 400ms）翻转一次 */
-        if (++tick % 20 == 0) {
-            DEBUG_LED_TOGGLE();
-        }
-
-        delay_ms(20);
+        ili9342_fill_rect(0, 0, 319, 239, colors[color_idx]);
+        DEBUG_LED_TOGGLE();
+        color_idx = (color_idx + 1) % num_colors;
+        delay_ms(1000);
     }
 
     return 0;
