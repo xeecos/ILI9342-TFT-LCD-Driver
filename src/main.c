@@ -61,7 +61,7 @@ int main(void)
         ili9342_fill_rect(0, 0, 319, 239, colors[color_idx]);
         DEBUG_LED_TOGGLE();
         color_idx = (color_idx + 1) % num_colors;
-        delay_ms(1000);
+        delay_ms(2000);
     }
 
     return 0;
