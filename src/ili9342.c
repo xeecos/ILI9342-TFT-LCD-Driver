@@ -4,6 +4,7 @@
 #include "ch32v30x_rcc.h"
 #include "ch32v30x_spi.h"
 #include "ch32v30x_tim.h"
+#include "ch32v30x_dma.h"
 #include <stddef.h>
 
 /* ======================== 引脚定义 ======================== */
@@ -49,6 +50,82 @@ static void lcd_write_data16(uint16_t data)
 {
     lcd_write_data((data >> 8) & 0xFF);
     lcd_write_data(data & 0xFF);
+}
+
+/*
+ * 连续发送 len 个数据字节，CS 在整个过程中保持低电平。
+ * 利用 TXE 标志实现流水线：前一个字节还在 SPI 移位输出时，
+ * 下一个字节已载入 TX 缓冲，大幅提升吞吐量。
+ */
+static void lcd_write_data_burst(const uint8_t *data, uint32_t len)
+{
+    if (len == 0) return;
+
+    GPIO_SetBits(GPIOB, LCD_RS_PIN);
+    GPIO_ResetBits(GPIOB, LCD_CS_PIN);
+
+    SPI_I2S_SendData(SPI2, data[0]);
+    for (uint32_t i = 1; i < len; i++) {
+        while (SPI_I2S_GetFlagStatus(SPI2, SPI_I2S_FLAG_TXE) == RESET) {}
+        SPI_I2S_SendData(SPI2, data[i]);
+    }
+    while (SPI_I2S_GetFlagStatus(SPI2, SPI_I2S_FLAG_BSY) == SET) {}
+
+    GPIO_SetBits(GPIOB, LCD_CS_PIN);
+}
+
+/*
+ * 切换到 SPI 16-bit 数据帧格式。
+ * 用于像素数据批量传输：一次发完整 16-bit RGB565 颜色值，
+ * SPI 事务数减半，吞吐量翻倍。
+ * 注意：必须在 SPI 空闲时切换，否则需先等待 BSY=0。
+ */
+static void lcd_spi_enter_16bit(void)
+{
+    while (SPI_I2S_GetFlagStatus(SPI2, SPI_I2S_FLAG_BSY) == SET) {}
+    SPI_Cmd(SPI2, DISABLE);
+    SPI2->CTLR1 |= SPI_CTLR1_DFF;
+    SPI_Cmd(SPI2, ENABLE);
+}
+
+/* 恢复到 SPI 8-bit 数据帧格式（命令/参数传输需要） */
+static void lcd_spi_exit_16bit(void)
+{
+    while (SPI_I2S_GetFlagStatus(SPI2, SPI_I2S_FLAG_BSY) == SET) {}
+    SPI_Cmd(SPI2, DISABLE);
+    SPI2->CTLR1 &= ~SPI_CTLR1_DFF;
+    SPI_Cmd(SPI2, ENABLE);
+}
+
+/*
+ * 使用 DMA 批量发送 16-bit 像素数据。
+ * SPI 必须在 16-bit 模式，DMA 以 HalfWord 为单位自动搬运。
+ * DMA 传输完毕后还需等待 SPI BSY，确保最后 1 字节从移位寄存器发出。
+ */
+static void lcd_dma_send_16bit(const uint16_t *data, uint32_t count)
+{
+    if (count == 0) return;
+
+    /* 配置本次传输的内存地址与数量 */
+    DMA_Cmd(DMA1_Channel5, DISABLE);
+    DMA1_Channel5->MADDR = (uint32_t)data;
+    DMA_SetCurrDataCounter(DMA1_Channel5, count);
+
+    /* 清除上次传输的标志 */
+    DMA_ClearFlag(DMA1_FLAG_TC5);
+
+    /* 启动 DMA — 每次 SPI TXE 自动搬运一个 16-bit 像素 */
+    DMA_Cmd(DMA1_Channel5, ENABLE);
+
+    /* 等待 DMA 传输完成 */
+    while (DMA_GetFlagStatus(DMA1_FLAG_TC5) == RESET) {}
+
+    /* 关闭 DMA 通道 */
+    DMA_Cmd(DMA1_Channel5, DISABLE);
+    DMA_ClearFlag(DMA1_FLAG_TC5);
+
+    /* 等待 SPI 发出最后一个字节 */
+    while (SPI_I2S_GetFlagStatus(SPI2, SPI_I2S_FLAG_BSY) == SET) {}
 }
 
 static void lcd_write_cmd_args(uint8_t cmd, const uint8_t *args, uint8_t n)
@@ -170,11 +247,33 @@ void ili9342_init(void)
     spi_init.SPI_CPOL                = SPI_CPOL_Low;
     spi_init.SPI_CPHA                = SPI_CPHA_1Edge;
     spi_init.SPI_NSS                 = SPI_NSS_Soft;
-    spi_init.SPI_BaudRatePrescaler   = SPI_BaudRatePrescaler_8;
+    spi_init.SPI_BaudRatePrescaler   = SPI_BaudRatePrescaler_2;
     spi_init.SPI_FirstBit            = SPI_FirstBit_MSB;
     spi_init.SPI_CRCPolynomial       = 7;
     SPI_Init(SPI2, &spi_init);
     SPI_Cmd(SPI2, ENABLE);
+
+    /* ---- DMA 初始化 (SPI2 TX: DMA1_Channel5) ---- */
+    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA1, ENABLE);
+
+    DMA_DeInit(DMA1_Channel5);
+    DMA_InitTypeDef dma_init = {0};
+    dma_init.DMA_PeripheralBaseAddr = (uint32_t)&SPI2->DATAR;
+    dma_init.DMA_MemoryBaseAddr     = (uint32_t)0;            /* 每次传输前设置 */
+    dma_init.DMA_DIR                = DMA_DIR_PeripheralDST;  /* 内存→外设 */
+    dma_init.DMA_BufferSize         = 0;                      /* 每次传输前设置 */
+    dma_init.DMA_PeripheralInc      = DMA_PeripheralInc_Disable;
+    dma_init.DMA_MemoryInc          = DMA_MemoryInc_Enable;
+    dma_init.DMA_PeripheralDataSize = DMA_PeripheralDataSize_HalfWord;
+    dma_init.DMA_MemoryDataSize     = DMA_MemoryDataSize_HalfWord;
+    dma_init.DMA_Mode               = DMA_Mode_Normal;
+    dma_init.DMA_Priority           = DMA_Priority_High;
+    dma_init.DMA_M2M                = DMA_M2M_Disable;
+    DMA_Init(DMA1_Channel5, &dma_init);
+
+    /* SPI2 TX DMA 请求使能 — 每次 TXE 时 DMA 自动载入下一个 16 位像素 */
+    SPI_I2S_DMACmd(SPI2, SPI_I2S_DMAReq_Tx, ENABLE);
+    DMA_Cmd(DMA1_Channel5, DISABLE);
 
     /* ---- 背光 PWM 初始化 (TIM1_CH2, PA9) ---- */
     /* 重新配置 PA9 为复用推挽输出 */
@@ -244,17 +343,45 @@ void ili9342_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 
 /* ======================== 绘图函数 ======================== */
 
+#define ROW_BATCH 1
+
 void ili9342_fill_rect(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t color)
 {
-    uint32_t pixels = (uint32_t)(x1 - x0 + 1) * (uint32_t)(y1 - y0 + 1);
+    uint16_t w = x1 - x0 + 1;
+    uint16_t h = y1 - y0 + 1;
+    if (w == 0 || h == 0) return;
+
     ili9342_set_window(x0, y0, x1, y1);
 
-    uint8_t hi = (color >> 8) & 0xFF;
-    uint8_t lo = color & 0xFF;
-    for (uint32_t i = 0; i < pixels; ++i) {
-        lcd_write_data(hi);
-        lcd_write_data(lo);
+    /* 1行缓冲 (320 × 1 = 320 像素 = 640 字节) */
+    static uint16_t s_buf[320 * ROW_BATCH];
+    uint32_t batch_pixels = (uint32_t)w * ROW_BATCH;
+    if (batch_pixels > 320 * ROW_BATCH) return;
+
+    /* 用颜色填充缓冲区 */
+    for (uint16_t i = 0; i < batch_pixels; i++) {
+        s_buf[i] = color;
     }
+
+    lcd_spi_enter_16bit();
+    GPIO_SetBits(GPIOB, LCD_RS_PIN);
+    GPIO_ResetBits(GPIOB, LCD_CS_PIN);
+
+    /* 每批 4 行 DMA 一次 */
+    uint16_t y = 0;
+    while (y + ROW_BATCH <= h) {
+        lcd_dma_send_16bit(s_buf, batch_pixels);
+        y += ROW_BATCH;
+    }
+
+    /* 剩余不足 4 行的部分 */
+    uint16_t remaining = h - y;
+    if (remaining > 0) {
+        lcd_dma_send_16bit(s_buf, (uint32_t)w * remaining);
+    }
+
+    GPIO_SetBits(GPIOB, LCD_CS_PIN);
+    lcd_spi_exit_16bit();
 }
 
 void ili9342_draw_pixel(uint16_t x, uint16_t y, uint16_t color)
@@ -268,42 +395,74 @@ void ili9342_draw_bitmap(uint16_t x_start, uint16_t y_start,
                          uint16_t x_end,   uint16_t y_end,
                          const uint16_t *pixels)
 {
-    uint16_t w = x_end - x_start + 1;
-    uint16_t h = y_end - y_start + 1;
+    uint32_t total = (uint32_t)(x_end - x_start + 1) * (uint32_t)(y_end - y_start + 1);
+    if (total == 0) return;
 
     ili9342_set_window(x_start, y_start, x_end, y_end);
 
+    /* 16-bit 模式 + DMA 一次搬完所有像素 */
+    lcd_spi_enter_16bit();
     GPIO_SetBits(GPIOB, LCD_RS_PIN);
     GPIO_ResetBits(GPIOB, LCD_CS_PIN);
-    for (uint16_t y = 0; y < h; y++) {
-        for (uint16_t x = 0; x < w; x++) {
-            uint16_t color = pixels[y * w + x];
-            SPI_I2S_SendData(SPI2, (color >> 8) & 0xFF);
-            while (SPI_I2S_GetFlagStatus(SPI2, SPI_I2S_FLAG_BSY) == SET) {}
-            SPI_I2S_SendData(SPI2, color & 0xFF);
-            while (SPI_I2S_GetFlagStatus(SPI2, SPI_I2S_FLAG_BSY) == SET) {}
-        }
-    }
+
+    lcd_dma_send_16bit(pixels, total);
+
     GPIO_SetBits(GPIOB, LCD_CS_PIN);
+    lcd_spi_exit_16bit();
 }
 
 void ili9342_draw_rgb565_scaled(const uint8_t *src_pixels,
                                 uint16_t src_w, uint16_t src_h,
                                 uint16_t dst_w, uint16_t dst_h)
 {
+    if (dst_w == 0 || dst_h == 0) return;
+
     ili9342_set_window(0, 0, dst_w - 1, dst_h - 1);
 
-    for (uint16_t y = 0; y < dst_h; ++y) {
-        uint16_t src_y = (uint16_t)(((uint32_t)y * src_h) / dst_h);
-        for (uint16_t x = 0; x < dst_w; ++x) {
-            uint16_t src_x = (uint16_t)(((uint32_t)x * src_w) / dst_w);
-            uint32_t src_index = (uint32_t)(src_y * src_w + src_x) * 2u;
-            uint16_t color = ((uint16_t)src_pixels[src_index] << 8)
-                           | src_pixels[src_index + 1];
-            lcd_write_data((color >> 8) & 0xFF);
-            lcd_write_data(color & 0xFF);
+    /* 16行缓冲 (320 × 16 像素) */
+    static uint16_t s_buf[320 * ROW_BATCH];
+    uint32_t batch_pixels = (uint32_t)dst_w * ROW_BATCH;
+    if (batch_pixels > 320 * ROW_BATCH) return;
+
+    lcd_spi_enter_16bit();
+    GPIO_SetBits(GPIOB, LCD_RS_PIN);
+    GPIO_ResetBits(GPIOB, LCD_CS_PIN);
+
+    uint16_t y = 0;
+    while (y + ROW_BATCH <= dst_h) {
+        /* 填充 4 行像素 */
+        uint16_t *p = s_buf;
+        for (uint16_t row = 0; row < ROW_BATCH; row++) {
+            uint16_t src_y = (uint16_t)(((uint32_t)(y + row) * src_h) / dst_h);
+            for (uint16_t x = 0; x < dst_w; ++x) {
+                uint16_t src_x = (uint16_t)(((uint32_t)x * src_w) / dst_w);
+                uint32_t src_index = (uint32_t)(src_y * src_w + src_x) * 2u;
+                *p++ = ((uint16_t)src_pixels[src_index] << 8)
+                     | src_pixels[src_index + 1];
+            }
         }
+        lcd_dma_send_16bit(s_buf, batch_pixels);
+        y += ROW_BATCH;
     }
+
+    /* 剩余不足 4 行 */
+    uint16_t remaining = dst_h - y;
+    if (remaining > 0) {
+        uint16_t *p = s_buf;
+        for (uint16_t row = 0; row < remaining; row++) {
+            uint16_t src_y = (uint16_t)(((uint32_t)(y + row) * src_h) / dst_h);
+            for (uint16_t x = 0; x < dst_w; ++x) {
+                uint16_t src_x = (uint16_t)(((uint32_t)x * src_w) / dst_w);
+                uint32_t src_index = (uint32_t)(src_y * src_w + src_x) * 2u;
+                *p++ = ((uint16_t)src_pixels[src_index] << 8)
+                     | src_pixels[src_index + 1];
+            }
+        }
+        lcd_dma_send_16bit(s_buf, (uint32_t)dst_w * remaining);
+    }
+
+    GPIO_SetBits(GPIOB, LCD_CS_PIN);
+    lcd_spi_exit_16bit();
 }
 
 /* ======================== 背光 PWM ======================== */
@@ -385,4 +544,42 @@ void ili9342_swap_xy(uint8_t swap)
     else      g_madctl &= ~ILI9342_MADCTL_MV;
 
     lcd_write_cmd_args(ILI9342_CMD_MADCTL, &g_madctl, 1);
+}
+
+/* ======================== TE 垂直同步 ======================== */
+
+/*
+ * TE (Tearing Effect) 引脚垂直同步配置。
+ *
+ * TE 信号由 ILI9342 在帧扫描到指定行时产生，MCU 检测此信号后
+ * 才写入 GRAM，可以避免画面撕裂（断层）。
+ *
+ * 硬件接线：ILI9342 TE 引脚 → MCU 任意 GPIO（建议使用中断引脚）。
+ *
+ * 参数:
+ *   enable     - 1=开启 TE, 0=关闭
+ *   mode       - 0: V-Blanking 时输出 TE (推荐)
+ *                1: V-Blanking + H-Blanking 都输出
+ *   scan_lines - TE 触发行号 (0 = 帧末自动触发, 通常设为 display_height)
+ *
+ * 典型用法（假设 TE 接 PA0）:
+ *   ili9342_tearing_configure(1, 0, 240);
+ *   然后每次写屏前:
+ *     while (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_0) == 0) {}  // 等 TE 高
+ *     while (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_0) != 0) {}  // 等 TE 低
+ *     ili9342_fill_rect(...);                                     // 写 GRAM
+ */
+void ili9342_tearing_configure(uint8_t enable, uint8_t mode, uint16_t scan_lines)
+{
+    if (enable) {
+        /* 先设触发行，再开启 TE */
+        uint8_t tearline[] = { (uint8_t)(scan_lines & 0xFF),
+                               (uint8_t)(scan_lines >> 8) };
+        lcd_write_cmd_args(ILI9342_CMD_TEARLINE, tearline, 2);
+
+        uint8_t temod = mode & 0x01;
+        lcd_write_cmd_args(ILI9342_CMD_TEON, &temod, 1);
+    } else {
+        lcd_write_cmd(ILI9342_CMD_TEOFF);
+    }
 }

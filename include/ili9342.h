@@ -15,6 +15,9 @@
 #define ILI9342_CMD_RAMWR    0x2C
 #define ILI9342_CMD_MADCTL   0x36
 #define ILI9342_CMD_COLMOD   0x3A
+#define ILI9342_CMD_TEOFF    0x34
+#define ILI9342_CMD_TEON     0x35
+#define ILI9342_CMD_TEARLINE 0x44
 
 /* ==================== MADCTL 位定义 ==================== */
 #define ILI9342_MADCTL_MY   0x80  /* Row Address Order */
@@ -67,5 +70,8 @@ void ili9342_set_rotation(uint8_t rotation);
 /* 设置 MADCTL 寄存器的镜像/交换位（高级用法） */
 void ili9342_set_mirror(uint8_t mirror_x, uint8_t mirror_y);
 void ili9342_swap_xy(uint8_t swap);
+
+/* TE 垂直同步控制 */
+void ili9342_tearing_configure(uint8_t enable, uint8_t mode, uint16_t scan_lines);
 
 #endif /* ILI9342_H */
