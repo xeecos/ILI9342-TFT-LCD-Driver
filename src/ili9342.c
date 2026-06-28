@@ -326,7 +326,7 @@ void ili9342_init(void)
             delay_ms(c->delay_ms);
         }
     }
-    ili9342_set_frame_rate(0, 0x8); 
+    ili9342_set_frame_rate(0, 0x10); 
 }
 
 /* ======================== 窗口设置 ======================== */
