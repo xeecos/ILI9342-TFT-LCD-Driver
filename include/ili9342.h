@@ -18,6 +18,7 @@
 #define ILI9342_CMD_TEOFF    0x34
 #define ILI9342_CMD_TEON     0x35
 #define ILI9342_CMD_TEARLINE 0x44
+#define ILI9342_CMD_FRMCTR1  0xB1
 
 /* ==================== MADCTL 位定义 ==================== */
 #define ILI9342_MADCTL_MY   0x80  /* Row Address Order */
@@ -73,5 +74,8 @@ void ili9342_swap_xy(uint8_t swap);
 
 /* TE 垂直同步控制 */
 void ili9342_tearing_configure(uint8_t enable, uint8_t mode, uint16_t scan_lines);
+
+/* 设置帧率 (FRMCTR1, B1h) */
+void ili9342_set_frame_rate(uint8_t diva, uint8_t rtna);
 
 #endif /* ILI9342_H */

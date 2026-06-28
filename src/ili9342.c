@@ -326,6 +326,7 @@ void ili9342_init(void)
             delay_ms(c->delay_ms);
         }
     }
+    ili9342_set_frame_rate(0, 0x8); 
 }
 
 /* ======================== 窗口设置 ======================== */
@@ -343,7 +344,7 @@ void ili9342_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 
 /* ======================== 绘图函数 ======================== */
 
-#define ROW_BATCH 1
+#define ROW_BATCH 24
 
 void ili9342_fill_rect(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t color)
 {
@@ -582,4 +583,30 @@ void ili9342_tearing_configure(uint8_t enable, uint8_t mode, uint16_t scan_lines
     } else {
         lcd_write_cmd(ILI9342_CMD_TEOFF);
     }
+}
+
+/* ======================== 帧率控制 ======================== */
+
+/*
+ * 设置显示帧刷新率 (FRMCTR1, B1h)。
+ *
+ * 参数:
+ *   diva - 内部分频比 [1:0]
+ *           0: 1/1 (最快)
+ *           1: 1/2
+ *           2: 1/4
+ *           3: 1/8 (最慢)
+ *   rtna - 每行内部时钟周期数 [4:0]
+ *           默认 0x1B (27 周期)
+ *           增大 → 帧率降低, 增大 → 帧率升高
+ *
+ * 默认值: diva=0, rtna=0x1B
+ * 典型加速: diva=0, rtna=0x12 (18 周期) 约可提升 ~30% 帧率
+ */
+void ili9342_set_frame_rate(uint8_t diva, uint8_t rtna)
+{
+    uint8_t args[2];
+    args[0] = diva & 0x03;
+    args[1] = rtna & 0x1F;
+    lcd_write_cmd_args(ILI9342_CMD_FRMCTR1, args, 2);
 }
